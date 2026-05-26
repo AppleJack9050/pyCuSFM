@@ -244,6 +244,66 @@ The example data in `data/r2b_galileo` demonstrates the expected format with 4 s
 
 </details>
 
+### COLMAP-style Monocular Input
+
+PyCuSFM can also consume a bare COLMAP-style monocular dataset directly:
+
+```
+<dataset>/
+└── images/
+    ├── frame_001.jpg
+    ├── frame_002.jpg
+    └── ...
+```
+
+Enable this mode with `--colmap_input` and supply intrinsics. PyCuSFM
+auto-generates `frames_meta.json` (identity poses, single monocular camera,
+pseudo-timestamps at 30 Hz) and configures the pipeline for no-prior input:
+`--skip_cuvslam`, `--skip_pose_graph`, `--skip_data_association`, and
+`--min_inter_frame_distance=0 --min_inter_frame_rotation_degrees=0`. These
+defaults can be overridden by passing the flag explicitly.
+
+```bash
+cusfm_cli \
+    --input_dir /path/to/dataset \
+    --cusfm_base_dir /path/to/output \
+    --colmap_input \
+    --image_width 1920 --image_height 1080 \
+    --camera_model PINHOLE \
+    --camera_params "1000,1000,960,540"
+```
+
+**Required flags for `--colmap_input`:**
+- `--input_dir`: dataset root containing `images/`
+- `--image_width`, `--image_height`: image dimensions in pixels
+- `--camera_params`: intrinsic parameters (comma- or space-separated)
+
+**Optional flags:**
+- `--camera_model`: `PINHOLE` (default), `DISTORTED_PINHOLE`, or `OPENCV_FISHEYE`
+- `--colmap_image_subdir`: image subdir name (default: `images`)
+
+**Param ordering by model:**
+| `--camera_model` | `--camera_params` |
+|------------------|-------------------|
+| `PINHOLE` | `fx,fy,cx,cy` |
+| `DISTORTED_PINHOLE` | `fx,fy,cx,cy,k1,k2,p1,p2[,k3,k4,k5,k6]` |
+| `OPENCV_FISHEYE` | `fx,fy,cx,cy,k1,k2,k3,k4` |
+
+> ⚠️ This mode runs without initial camera poses, so reconstruction quality
+> depends entirely on feature matching. For best results, prefer providing
+> initial poses (via `--override_frames_meta_file` or a cuVSLAM run).
+
+You can also invoke the converter standalone to inspect the generated
+`frames_meta.json` before running the pipeline:
+
+```bash
+python -m pycusfm.generate_frame_meta \
+    --colmap-input /path/to/dataset \
+    --image-width 1920 --image-height 1080 \
+    --camera-model PINHOLE \
+    --camera-params "1000,1000,960,540"
+```
+
 ### Rosbag Conversion
 
 To convert a rosbag to the required mapping data format, follow the [ISAAC Mapping ROS tutorial](https://nvidia-isaac-ros.github.io/repositories_and_packages/isaac_ros_mapping_and_localization/isaac_mapping_ros/index.html). This will help you:

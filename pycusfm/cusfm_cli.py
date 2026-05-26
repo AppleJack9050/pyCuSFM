@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import os
+
 from .cusfm_runner import create_cusfm_runner
 
 
@@ -267,6 +269,48 @@ def main():
         help=(
             'Specifies the RGBD mode 3 for AMAZON, 2 for STEREO, 1 for ARKID'))
 
+    # COLMAP-style monocular input options
+    add_bool_argument(
+        parser,
+        'colmap_input',
+        help=(
+            'Treat --input_dir as a COLMAP-style monocular dataset '
+            '(<input_dir>/images/*.jpg). Auto-generates frames_meta.json with '
+            'identity poses and forces --skip_cuvslam --skip_pose_graph and '
+            'min inter-frame thresholds to 0. Requires intrinsics via '
+            '--camera_model/--camera_params (or defaults).'))
+    parser.add_argument(
+        '--camera_model',
+        type=str,
+        default='PINHOLE',
+        choices=['PINHOLE', 'DISTORTED_PINHOLE', 'OPENCV_FISHEYE'],
+        help='Camera projection model for --colmap_input')
+    parser.add_argument(
+        '--camera_params',
+        type=str,
+        default=None,
+        help=(
+            'Comma- or space-separated intrinsic params for --colmap_input. '
+            'PINHOLE: fx,fy,cx,cy. '
+            'DISTORTED_PINHOLE: fx,fy,cx,cy,k1,k2,p1,p2[,k3,k4,k5,k6]. '
+            'OPENCV_FISHEYE: fx,fy,cx,cy,k1,k2,k3,k4.'))
+    parser.add_argument(
+        '--image_width',
+        type=int,
+        default=None,
+        help='Image width in pixels (used with --colmap_input)')
+    parser.add_argument(
+        '--image_height',
+        type=int,
+        default=None,
+        help='Image height in pixels (used with --colmap_input)')
+    parser.add_argument(
+        '--colmap_image_subdir',
+        type=str,
+        default='images',
+        help='Image subdirectory under --input_dir for --colmap_input '
+             '(default: images)')
+
     args = parser.parse_args()
 
     if args.steps_to_run:
@@ -293,6 +337,51 @@ def main():
 
     if args.av_data:
         args.config_set = 'av'
+
+    if args.colmap_input:
+        from .generate_frame_meta import (
+            generate_frames_meta_from_colmap_input, parse_camera_params_str)
+
+        if not args.input_dir:
+            raise ValueError(
+                "--input_dir is required when --colmap_input is set.")
+        if args.image_width is None or args.image_height is None:
+            raise ValueError(
+                "--image_width and --image_height are required when "
+                "--colmap_input is set.")
+
+        camera_params = parse_camera_params_str(args.camera_params)
+        if not camera_params:
+            raise ValueError(
+                "--camera_params is required when --colmap_input is set "
+                "(e.g. PINHOLE: \"fx,fy,cx,cy\").")
+
+        frames_meta_path = args.override_frames_meta_file or os.path.join(
+            args.input_dir, 'frames_meta.json')
+        generate_frames_meta_from_colmap_input(
+            input_dir=args.input_dir,
+            output_path=frames_meta_path,
+            image_width=args.image_width,
+            image_height=args.image_height,
+            camera_model=args.camera_model,
+            camera_params=camera_params,
+            image_subdir=args.colmap_image_subdir,
+        )
+
+        # Force pipeline flags compatible with monocular identity-pose input.
+        # User explicit overrides win.
+        if args.skip_cuvslam is None:
+            args.skip_cuvslam = True
+        if args.skip_pose_graph is None:
+            args.skip_pose_graph = True
+        if args.skip_data_association is None:
+            args.skip_data_association = True
+        if args.min_inter_frame_distance is None:
+            args.min_inter_frame_distance = 0.0
+        if args.min_inter_frame_rotation_degrees is None:
+            args.min_inter_frame_rotation_degrees = 0.0
+        if not args.override_frames_meta_file:
+            args.override_frames_meta_file = frames_meta_path
 
     # Create runner using the new helper function
     cusfm_runner = create_cusfm_runner(

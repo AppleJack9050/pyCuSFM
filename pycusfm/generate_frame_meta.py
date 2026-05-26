@@ -724,6 +724,215 @@ def generate_frames_meta(poses_path: str,
     print(f"  Unique synced sample IDs: {unique_synced_ids}")
 
 
+SUPPORTED_IMAGE_EXTENSIONS = ('.jpeg', '.jpg', '.png', '.JPEG', '.JPG', '.PNG')
+
+
+def parse_camera_params_str(params_str: str) -> List[float]:
+    """Parse a comma- or space-separated string of floats."""
+    if params_str is None:
+        return []
+    tokens = re.split(r'[\s,]+', params_str.strip())
+    return [float(t) for t in tokens if t]
+
+
+def build_monocular_camera_params(image_width: int,
+                                  image_height: int,
+                                  camera_model: str,
+                                  camera_params: List[float],
+                                  frequency: float = 30.0) -> Dict[str, Dict]:
+    """Build a single-camera camera_params_id_to_camera_params entry.
+
+    camera_model is one of:
+      - PINHOLE: params = [fx, fy, cx, cy]
+      - DISTORTED_PINHOLE: params = [fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, k5, k6]
+        (any tail of zero distortion can be omitted; we pad to 8 distortion coeffs)
+      - OPENCV_FISHEYE: params = [fx, fy, cx, cy, k1, k2, k3, k4]
+    """
+    if camera_model == "PINHOLE":
+        if len(camera_params) != 4:
+            raise ValueError(
+                f"PINHOLE requires 4 params [fx, fy, cx, cy], "
+                f"got {len(camera_params)}")
+        fx, fy, cx, cy = camera_params
+        intrinsic = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+        distortion_coefficients = []
+    elif camera_model == "DISTORTED_PINHOLE":
+        if len(camera_params) < 4:
+            raise ValueError(
+                f"DISTORTED_PINHOLE requires at least 4 params "
+                f"[fx, fy, cx, cy, ...distortion], got {len(camera_params)}")
+        fx, fy, cx, cy = camera_params[:4]
+        intrinsic = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+        distortion_coefficients = list(camera_params[4:])
+        # Pad to 8 coeffs (k1, k2, p1, p2, k3, k4, k5, k6) so the model resolves
+        # to DISTORTED_PINHOLE in determine_projection_model_type().
+        while len(distortion_coefficients) < 8:
+            distortion_coefficients.append(0.0)
+        if len(distortion_coefficients) > 8:
+            raise ValueError(
+                f"DISTORTED_PINHOLE supports up to 8 distortion coefficients, "
+                f"got {len(distortion_coefficients)}")
+    elif camera_model == "OPENCV_FISHEYE":
+        if len(camera_params) != 8:
+            raise ValueError(
+                f"OPENCV_FISHEYE requires 8 params "
+                f"[fx, fy, cx, cy, k1, k2, k3, k4], got {len(camera_params)}")
+        fx, fy, cx, cy, k1, k2, k3, k4 = camera_params
+        intrinsic = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+        distortion_coefficients = [k1, k2, k3, k4]
+    else:
+        raise ValueError(
+            f"Unsupported camera_model '{camera_model}'. "
+            f"Use PINHOLE, DISTORTED_PINHOLE, or OPENCV_FISHEYE.")
+
+    projection_model_type = determine_projection_model_type(
+        distortion_coefficients, "0")
+
+    calibration_parameters = {
+        "image_width": image_width,
+        "image_height": image_height,
+    }
+    if projection_model_type == "PINHOLE":
+        projection_matrix = [
+            fx, 0.0, cx, 0.0,
+            0.0, fy, cy, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ]
+        calibration_parameters["projection_matrix"] = {
+            "data": projection_matrix,
+            "row_count": 3,
+            "column_count": 4,
+        }
+    else:
+        calibration_parameters["camera_matrix"] = {
+            "data": intrinsic,
+            "row_count": 3,
+            "column_count": 3,
+        }
+        calibration_parameters["distortion_coefficients"] = {
+            "data": distortion_coefficients,
+            "row_count": 1,
+            "column_count": len(distortion_coefficients),
+        }
+
+    sensor_meta_data = {
+        "sensor_id": 0,
+        "sensor_type": "CAMERA",
+        "sensor_name": "camera_0",
+        "frequency": frequency,
+        "sensor_to_vehicle_transform": {
+            "axis_angle": {
+                "x": 0.0, "y": 0.0, "z": 1.0, "angle_degrees": 0.0,
+            },
+            "translation": {"x": 0.0, "y": 0.0, "z": 0.0},
+        },
+    }
+
+    return {
+        "0": {
+            "sensor_meta_data": sensor_meta_data,
+            "calibration_parameters": calibration_parameters,
+            "camera_projection_model_type": projection_model_type,
+        }
+    }
+
+
+def generate_frames_meta_from_colmap_input(input_dir: str,
+                                           output_path: str,
+                                           image_width: int,
+                                           image_height: int,
+                                           camera_model: str = "PINHOLE",
+                                           camera_params: Optional[List[float]] = None,
+                                           image_subdir: str = "images",
+                                           frequency: float = 30.0) -> None:
+    """Generate frames_meta.json from a COLMAP-style monocular dataset.
+
+    Expected layout:
+        <input_dir>/
+        └── <image_subdir>/        # default: "images"
+            ├── frame_001.jpg
+            ├── frame_002.jpg
+            └── ...
+
+    Produces identity-pose keyframes with pseudo-timestamps at `frequency` Hz
+    and a single monocular camera using the supplied intrinsics. Images are
+    listed in filename-sorted order; image_name is "<image_subdir>/<filename>".
+    """
+    print(f"\n{'=' * 70}")
+    print(f"  COLMAP INPUT MODE: Generating from monocular images folder")
+    print(f"{'=' * 70}\n")
+
+    images_dir = os.path.join(input_dir, image_subdir)
+    if not os.path.isdir(images_dir):
+        raise FileNotFoundError(
+            f"Expected images directory at '{images_dir}'. "
+            f"COLMAP input mode requires <input_dir>/{image_subdir}/.")
+
+    image_files = sorted(
+        f for f in os.listdir(images_dir)
+        if f.endswith(SUPPORTED_IMAGE_EXTENSIONS))
+    if not image_files:
+        raise ValueError(
+            f"No supported image files found in '{images_dir}'. "
+            f"Supported extensions: {SUPPORTED_IMAGE_EXTENSIONS}")
+    print(f"  Found {len(image_files)} image(s) in {images_dir}")
+
+    if camera_params is None:
+        camera_params = []
+    camera_params_id_to_camera_params = build_monocular_camera_params(
+        image_width=image_width,
+        image_height=image_height,
+        camera_model=camera_model,
+        camera_params=camera_params,
+        frequency=frequency,
+    )
+
+    frame_interval_us = int(1_000_000 / frequency)
+    identity_axis_angle = {"x": 0.0, "y": 0.0, "z": 1.0, "angle_degrees": 0.0}
+    identity_translation = {"x": 0.0, "y": 0.0, "z": 0.0}
+
+    keyframes_metadata = []
+    for idx, filename in enumerate(image_files):
+        timestamp_us = idx * frame_interval_us
+        keyframes_metadata.append({
+            "id": str(idx),
+            "camera_params_id": "0",
+            "timestamp_microseconds": str(timestamp_us),
+            "image_name": f"{image_subdir}/{filename}",
+            "camera_to_world": {
+                "axis_angle": identity_axis_angle,
+                "translation": identity_translation,
+            },
+            "synced_sample_id": str(idx),
+        })
+
+    output_data = {
+        "keyframes_metadata": keyframes_metadata,
+        "initial_pose_type": "EGO_MOTION",
+        "camera_params_id_to_session_name": {"0": "0"},
+        "camera_params_id_to_camera_params": camera_params_id_to_camera_params,
+        "stereo_pair": [],
+    }
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump(output_data, f, indent=2)
+
+    print(f"\n{'=' * 70}")
+    print(f"  ✓ Generated frames_meta.json (COLMAP INPUT MODE)")
+    print(f"{'=' * 70}")
+    print(f"  Output:          {output_path}")
+    print(f"  Total keyframes: {len(keyframes_metadata)}")
+    print(f"  Camera model:    {camera_model}")
+    print(f"  Image size:      {image_width} x {image_height}")
+    print(f"  Note: monocular identity-pose input. For best results in the "
+          f"cuSFM pipeline, use --skip_cuvslam --skip_pose_graph and set "
+          f"--min_inter_frame_distance=0 --min_inter_frame_rotation_degrees=0.")
+    print(f"{'=' * 70}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Generate frames_meta.json from poses.csv or image folders',
@@ -736,18 +945,28 @@ MODE 1: Generate from poses.csv (with real camera poses)
         --config /path/to/config.yaml \\
         --output /path/to/frames_meta.json
 
-MODE 2: Generate from image folders (with identity poses for mapping)
-======================================================================
+MODE 2: Generate from stereo image folders (identity poses)
+============================================================
     python generate_frame_meta.py \\
         --images /path/to/image_folder \\
         --config /path/to/config.yaml \\
         --output /path/to/frames_meta.json \\
         [--use-pseudo-timestamps]
 
+MODE 3: Generate from a COLMAP-style monocular dataset (identity poses)
+========================================================================
+    python generate_frame_meta.py \\
+        --colmap-input /path/to/dataset \\
+        --image-width 1920 --image-height 1080 \\
+        --camera-model PINHOLE \\
+        --camera-params "fx,fy,cx,cy" \\
+        [--output /path/to/frames_meta.json]
+
 Notes:
   - Mode 1: For datasets with known camera poses (from COLMAP, SLAM, etc.)
-  - Mode 2: For raw stereo image pairs, generates identity poses for cuSFM mapping
-  - Mode 2 supports ONLY single stereo pairs (left/right folders)
+  - Mode 2: For raw stereo image pairs (left/right folders); identity poses
+  - Mode 3: For monocular COLMAP-style layout <dataset>/images/*.jpg;
+            identity poses, pseudo-timestamps at 30Hz, single camera
         """)
 
     # Mutually exclusive input modes
@@ -760,18 +979,21 @@ Notes:
         '--images',
         type=str,
         help='Path to image folder containing left/right subdirs (Mode 2)')
+    input_group.add_argument(
+        '--colmap-input',
+        type=str,
+        help='Path to a COLMAP-style dataset directory containing images/ (Mode 3)')
 
     parser.add_argument(
         '--config',
         type=str,
-        required=True,
-        help='Path to YAML config file')
+        help='Path to YAML config file (required for Mode 1 and Mode 2)')
 
     parser.add_argument(
         '--output',
         type=str,
-        required=True,
-        help='Output path for frames_meta.json')
+        help='Output path for frames_meta.json '
+             '(defaults to <colmap-input>/frames_meta.json in Mode 3)')
 
     # Mode 2 specific options
     parser.add_argument(
@@ -779,18 +1001,40 @@ Notes:
         action='store_true',
         help='Use sequential pseudo timestamps at 30Hz (Mode 2 only)')
 
-    args = parser.parse_args()
+    # Mode 3 specific options
+    parser.add_argument('--image-width', type=int, default=1920,
+                        help='Image width in pixels (Mode 3)')
+    parser.add_argument('--image-height', type=int, default=1080,
+                        help='Image height in pixels (Mode 3)')
+    parser.add_argument(
+        '--camera-model',
+        type=str,
+        default='PINHOLE',
+        choices=['PINHOLE', 'DISTORTED_PINHOLE', 'OPENCV_FISHEYE'],
+        help='Camera projection model (Mode 3)')
+    parser.add_argument(
+        '--camera-params',
+        type=str,
+        default=None,
+        help='Comma- or space-separated intrinsic params (Mode 3). '
+             'PINHOLE: fx,fy,cx,cy. '
+             'DISTORTED_PINHOLE: fx,fy,cx,cy,k1,k2,p1,p2[,k3,k4,k5,k6]. '
+             'OPENCV_FISHEYE: fx,fy,cx,cy,k1,k2,k3,k4.')
+    parser.add_argument('--image-subdir', type=str, default='images',
+                        help='Subdirectory name containing images (Mode 3)')
 
-    # Validate config exists
-    if not os.path.exists(args.config):
-        print(f"Error: Config file not found: {args.config}")
-        return 1
+    args = parser.parse_args()
 
     # Route to appropriate mode
     if args.poses:
-        # Mode 1: Poses mode
+        if not args.config or not os.path.exists(args.config):
+            print(f"Error: --config is required for Mode 1")
+            return 1
         if not os.path.exists(args.poses):
             print(f"Error: Pose file not found: {args.poses}")
+            return 1
+        if not args.output:
+            print(f"Error: --output is required for Mode 1")
             return 1
 
         generate_frames_meta(
@@ -800,9 +1044,14 @@ Notes:
         )
 
     elif args.images:
-        # Mode 2: Images mode
+        if not args.config or not os.path.exists(args.config):
+            print(f"Error: --config is required for Mode 2")
+            return 1
         if not os.path.isdir(args.images):
             print(f"Error: Image directory not found: {args.images}")
+            return 1
+        if not args.output:
+            print(f"Error: --output is required for Mode 2")
             return 1
 
         generate_frames_meta_from_images(
@@ -810,6 +1059,28 @@ Notes:
             config_path=args.config,
             output_path=args.output,
             use_pseudo_timestamps=args.use_pseudo_timestamps
+        )
+
+    elif args.colmap_input:
+        if not os.path.isdir(args.colmap_input):
+            print(f"Error: COLMAP input directory not found: {args.colmap_input}")
+            return 1
+        output_path = args.output or os.path.join(
+            args.colmap_input, 'frames_meta.json')
+        try:
+            camera_params = parse_camera_params_str(args.camera_params)
+        except ValueError as e:
+            print(f"Error parsing --camera-params: {e}")
+            return 1
+
+        generate_frames_meta_from_colmap_input(
+            input_dir=args.colmap_input,
+            output_path=output_path,
+            image_width=args.image_width,
+            image_height=args.image_height,
+            camera_model=args.camera_model,
+            camera_params=camera_params,
+            image_subdir=args.image_subdir,
         )
 
     return 0
